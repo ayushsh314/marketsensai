@@ -1,0 +1,2 @@
+# Colab / GPU install (same as `pip install -e ".[vllm,png]"`); dependencies live in pyproject.toml
+-e .[vllm,png]

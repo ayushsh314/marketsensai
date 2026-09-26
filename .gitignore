@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data & outputs (dataset is downloaded separately — see README)
+data/*
+!data/.gitkeep
+outputs/
+*.index
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Paper (outdated until rewritten)
+docs/MarketSensAI_Report.pdf

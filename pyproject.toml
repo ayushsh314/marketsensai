@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marketsensai"
+version = "0.2.0"
+description = "Explains stock moves from the news, grounded in market data"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Anandavardhana Hegde" },
+    { name = "Ayush Sharma" },
+    { name = "Yogesh Thakku Suresh" },
+]
+dependencies = [
+    "sentence-transformers>=3.0.0",
+    "langgraph>=0.2.0",
+    "yfinance>=0.2.50",
+    "requests",
+    "plotly>=5.19,<6",
+    "pandas",
+    "numpy",
+]
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.6.3"]  # LLM.chat with batched conversations
+hf = ["transformers>=4.44.0", "accelerate>=0.33.0", "bitsandbytes>=0.43.0"]
+png = ["kaleido==0.2.1"]
+dev = ["pytest"]
+
+[project.scripts]
+marketsensai = "marketsensai.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
