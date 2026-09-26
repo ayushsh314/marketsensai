@@ -12,6 +12,9 @@
 - throughput: articles processed and time taken
 """
 
+import math
+import os
+import re
 from collections import Counter
 from datetime import timedelta
 from typing import Dict, List, Optional
@@ -19,7 +22,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .agents import RELEVANT
+from .agents import RELEVANT, EventAttributionAgent, format_event_data
 from .config import Config
 from .llm import generate_json
 from .prices import MarketData
@@ -46,6 +49,22 @@ def spearman(x: pd.Series, y: pd.Series) -> Optional[float]:
     if len(d) < 5 or d.iloc[:, 0].nunique() < 2 or d.iloc[:, 1].nunique() < 2:
         return None
     return round(float(np.corrcoef(d.iloc[:, 0].rank(), d.iloc[:, 1].rank())[0, 1]), 3)
+
+
+def rank_correlation(x: pd.Series, y: pd.Series) -> Dict:
+    """Spearman ρ with a 95% CI and two-sided p-value (Fisher z, with the Fieller et al. variance 1.06/(n−3))."""
+    n = len(pd.concat([x, y], axis=1).dropna())
+    rho = spearman(x, y)
+    if rho is None:
+        return {"rho": None, "n": n}
+    z = math.atanh(min(max(rho, -0.9999), 0.9999))
+    se = math.sqrt(1.06 / (n - 3))
+    return {
+        "rho": rho,
+        "n": n,
+        "ci95": [round(math.tanh(z - 1.96 * se), 3), round(math.tanh(z + 1.96 * se), 3)],
+        "p_value": round(math.erfc(abs(z) / se / math.sqrt(2)), 4),
+    }
 
 
 def _relevant(enriched: pd.DataFrame) -> pd.DataFrame:
@@ -78,19 +97,28 @@ def daily_sentiment(enriched: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"sentiment": g["sw"].sum() / g["relevance"].sum(), "articles": g.size()})
 
 
-def sentiment_alignment(enriched: pd.DataFrame, feats: pd.DataFrame) -> Dict:
+def sentiment_days(enriched: pd.DataFrame, feats: pd.DataFrame) -> pd.DataFrame:
+    """Daily news sentiment joined with that session's and the next session's abnormal return."""
     daily = daily_sentiment(enriched)
     if daily.empty:
-        return {"days": 0}
+        return pd.DataFrame(columns=["sentiment", "articles", "abn_ret", "abn_z", "next_abn_ret"])
     f = feats[["abn_ret", "abn_z"]].copy()
     f["next_abn_ret"] = f["abn_ret"].shift(-1)
-    d = daily.join(f, how="inner")
+    return daily.join(f, how="inner")
+
+
+def sentiment_alignment(d: pd.DataFrame) -> Dict:
+    if d.empty:
+        return {"days": 0}
     big = d[(d["abn_z"].abs() >= LARGE_MOVE_Z) & (d["sentiment"] != 0)]
     agree = (np.sign(big["sentiment"]) == np.sign(big["abn_ret"])).sum()
+    same, nxt = rank_correlation(d["sentiment"], d["abn_ret"]), rank_correlation(d["sentiment"], d["next_abn_ret"])
     return {
         "days": len(d),
-        "spearman_same_day": spearman(d["sentiment"], d["abn_ret"]),
-        "spearman_next_day": spearman(d["sentiment"], d["next_abn_ret"]),
+        "spearman_same_day": same["rho"],
+        "spearman_next_day": nxt["rho"],
+        "same_day": same,
+        "next_day": nxt,
         "large_move_days": len(big),
         "large_move_sign_agreement": _ratio(agree, len(big)),
     }
@@ -203,25 +231,109 @@ def judge_explanations(attributions: Dict[str, Dict], llm, sample: int) -> List[
     return [{"date": a["date"], **_scores(j, ATTRIBUTION_DIMS)} for a, j in zip(top, judged)]
 
 
+# ── Attribution controls (placebo tests) ──
+_OPPOSITES = [("High", "Low"), ("Large Gain", "Large Drop"), ("Market-Wide Rally", "Market-Wide Selloff"),
+              ("Gap Up", "Gap Down"), ("Breakout", "Breakdown"), ("Golden Cross", "Death Cross")]
+RETURN_COLS = ["ret", "bench_ret", "abn_ret", "ret_z", "abn_z"]
+
+
+def flip_label(label: str) -> Optional[str]:
+    """The same event in the opposite direction ("52-Week High" → "52-Week Low"); None if it has none."""
+    if EVENT_TYPES[label].direction == "neutral":
+        return label
+    for a, b in _OPPOSITES:
+        for x, y in ((a, b), (b, a)):
+            if label == x or label.endswith(f" {x}"):
+                return label[: len(label) - len(x)] + y
+    return None  # Correction, Bear Market: drawdowns have no upward twin
+
+
+def attribution_controls(ticker: str, attributions: Dict[str, Dict], stories: pd.DataFrame, feats: pd.DataFrame,
+                         trading_days: pd.DatetimeIndex, llm, cfg: Config) -> Dict:
+    """Re-explain every LLM-explained event day twice, with the evidence deliberately broken.
+
+    - shuffled news: the real market data, but the stories from a random session at least
+      cfg.control_min_gap_days trading days away. A model that uses the news should mostly say "unexplained".
+    - flipped direction: the real stories, but the move (returns, z-scores, labels) mirrored. Good news
+      shouldn't explain a drop, so a direction-aware model should again mostly say "unexplained".
+    If either explained rate is close to the real one, "explained" measures willingness to tell a story.
+    """
+    real = [a for a in attributions.values()
+            if a["primary_driver"] not in ("gradual", "no news") and not a.get("parse_failed")]
+    if not real or stories.empty:
+        return {"events": 0}
+    agent = EventAttributionAgent(llm, cfg)
+    rng = np.random.default_rng(cfg.seed)
+    by_id = stories.set_index("story_id", drop=False)
+    pool = trading_days[(trading_days >= stories["trading_date"].min()) & (trading_days <= stories["last_date"].max())]
+    pool_pos = trading_days.searchsorted(pool)
+    shuffled, flipped = [], []
+    for a in real:
+        date = pd.Timestamp(a["date"])
+        far = pool[np.abs(pool_pos - trading_days.searchsorted(date)) >= cfg.control_min_gap_days]
+        for other in rng.permutation(far.to_numpy()):
+            cands = agent.candidate_stories(pd.Timestamp(other), stories, trading_days)
+            if not cands.empty:
+                shuffled.append(agent.base(a["date"], a, cands, a["event_data"], a["move_type"]))
+                break
+        f = feats.loc[[date]].copy()
+        f[RETURN_COLS] = -f[RETURN_COLS]
+        labels = [x for x in (flip_label(l) for l in a["labels"]) if x]
+        row = {**a, "date": date, "labels": labels, "abn_ret": None if a["abn_ret"] is None else -a["abn_ret"]}
+        flipped.append(agent.base(a["date"], row, by_id.loc[a["stories"]], format_event_data(row, f), a["move_type"]))
+
+    def explained(items: List[Dict]) -> List[bool]:
+        return [x["primary_driver"] != "unexplained" and not x["parse_failed"] for x in items]
+
+    shuffled_ok = explained(agent.explain(ticker, shuffled))
+    flipped_ok = explained(agent.explain(ticker, flipped))
+    real_ok = explained(real)
+    return {
+        "events": len(real),
+        "explained_real": _ratio(sum(real_ok), len(real_ok)),
+        "shuffled_news_events": len(shuffled_ok),
+        "explained_shuffled_news": _ratio(sum(shuffled_ok), len(shuffled_ok)),
+        "explained_flipped_direction": _ratio(sum(flipped_ok), len(flipped_ok)),
+        "counts": {"real": [sum(real_ok), len(real_ok)], "shuffled": [sum(shuffled_ok), len(shuffled_ok)],
+                    "flipped": [sum(flipped_ok), len(flipped_ok)]},
+    }
+
+
 # ── Claim verification ──
-def verify_claims(enriched: pd.DataFrame, events: pd.DataFrame, hist: pd.DataFrame, cfg: Config) -> Dict:
-    """Price milestones stated in relevant articles, checked against actual price events."""
-    claims = [(r.trading_date, c) for r in enriched.itertuples()
+def verify_claims(enriched: pd.DataFrame, events: pd.DataFrame, hist: pd.DataFrame, cfg: Config,
+                  misses: Optional[List[Dict]] = None) -> Dict:
+    """Price milestones stated in relevant articles, checked against actual price events.
+
+    Claims whose label matches no event in the window are appended to `misses` (if given) for review.
+    """
+    claims = [(r, c) for r in enriched.itertuples()
               if pd.notna(r.trading_date) and (r.relevance or 0) >= RELEVANT for c in (r.price_claims or [])]
-    labelled = [(d, c) for d, c in claims if c.get("label")]
+    labelled = [(r, c) for r, c in claims if c.get("label")]
     exact = direction = priced = price_hits = 0
-    for date, c in labelled:
+    for r, c in labelled:
+        date = r.trading_date
         lo_d, hi_d = date - timedelta(days=cfg.claim_window_days), date + timedelta(days=1)
         near = events[(events["date"] >= lo_d) & (events["date"] <= hi_d)] if not events.empty else events
         labels = set(near["label"]) if not near.empty else set()
-        exact += c["label"] in labels
+        hit = c["label"] in labels
+        exact += hit
         direction += EVENT_TYPES[c["label"]].direction in {EVENT_TYPES[l].direction for l in labels}
+        price_ok = None
         if c.get("price") is not None:
             window = hist[(hist.index >= lo_d) & (hist.index <= hi_d)]
             if not window.empty:
                 priced += 1
                 lo, hi = window["Low"].min(), window["High"].max()
-                price_hits += lo * (1 - cfg.price_tolerance) <= c["price"] <= hi * (1 + cfg.price_tolerance)
+                price_ok = bool(lo * (1 - cfg.price_tolerance) <= c["price"] <= hi * (1 + cfg.price_tolerance))
+                price_hits += price_ok
+        if not hit and misses is not None:
+            misses.append({
+                "ticker": r.ticker, "trading_date": str(pd.Timestamp(date).date()), "title": r.title,
+                "url": r.url, "claim_as_written": c["event"], "claim_label": c["label"],
+                "claim_price": c.get("price"), "price_in_range": price_ok,
+                "events_in_window": ", ".join(sorted(labels)),
+                "verdict": "",  # for the reviewer: extraction error / loose wording / matching too strict / other
+            })
     return {
         "claims": len(claims),
         "verifiable": len(labelled),
@@ -232,7 +344,7 @@ def verify_claims(enriched: pd.DataFrame, events: pd.DataFrame, hist: pd.DataFra
     }
 
 
-# ── Reports, RAG, throughput ──
+# ── Reports ──
 def judge_reports(results: Dict[str, Dict], llm) -> Dict:
     items = [(t, r) for t, res in results.items() for r in res["reports"] if r["report"]]
     prompts = [REPORT_JUDGE_PROMPT.format(source_text=r["report_source"], summary_text=r["report"]) for _, r in items]
@@ -240,6 +352,77 @@ def judge_reports(results: Dict[str, Dict], llm) -> Dict:
             for (t, r), j in zip(items, generate_json(llm, prompts, 512))}
 
 
+_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+_NUMBER = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?")
+# Numbers that appear in briefings as names rather than data: "52-week", "50-day", "S&P 500", small counts.
+_STRUCTURAL = {13, 16, 26, 50, 52, 200, 500}
+
+
+def _numbers(text: str) -> List[str]:
+    return _NUMBER.findall(_DATE.sub(" ", text))
+
+
+def number_check(report: str, source: str) -> Dict:
+    """Every date and number in a briefing must appear in its source data.
+
+    A number counts as supported if some source number rounds to it ("38.3%" from 38.29, "$341" from
+    341.07). Signs are ignored ("down 3.40%" for -3.40%). This catches invented or garbled figures, not
+    real figures put in the wrong context.
+    """
+    src_dates = set(_DATE.findall(source))
+    src = {abs(float(n.replace(",", ""))) for n in _numbers(source)} | {float(d[:4]) for d in src_dates}
+    bad_dates = sorted({d for d in _DATE.findall(report) if d not in src_dates})
+    checked, bad = 0, []
+    for token in _numbers(report):
+        value = float(token.replace(",", ""))
+        if "." not in token and (value < 10 or value in _STRUCTURAL):
+            continue
+        checked += 1
+        places = len(token.split(".")[1]) if "." in token else 0
+        if not any(abs(round(s, places) - value) < 1e-9 for s in src):
+            bad.append(token)
+    return {"numbers": checked, "dates": len(_DATE.findall(report)), "unsupported_numbers": bad,
+            "unsupported_dates": bad_dates, "passed": not bad and not bad_dates}
+
+
+def check_reports(results: Dict[str, Dict]) -> Dict:
+    return {f"{t}_{r['time_range']}": number_check(r["report"], r["report_source"])
+            for t, res in results.items() for r in res["reports"] if r["report"]}
+
+
+# ── Human review files ──
+def review_items(results: Dict[str, Dict], judged: Dict[str, List[Dict]], claim_misses: List[Dict],
+                 cfg: Config) -> Dict[str, List[Dict]]:
+    """Blank rating sheets for the team: a random sample of judged explanations (so ratings can be compared
+    with the LLM judge by ticker and date), every briefing, and every claim miss."""
+    rng = np.random.default_rng(cfg.seed)
+    explanations, briefings = [], []
+    for t, r in results.items():
+        dates = [j["date"] for j in judged.get(t, [])]
+        for d in sorted(rng.permutation(dates)[:cfg.review_per_ticker]) if dates else []:
+            a = r["attributions"][d]
+            explanations.append({
+                "review_id": f"E{len(explanations) + 1}", "ticker": t, "date": d, "labels": ", ".join(a["labels"]),
+                "market_data": a["event_data"], "stories_shown": a["stories_text"], "explanation": a["explanation"],
+                "primary_driver": a["primary_driver"], "groundedness_1to5": "", "plausibility_1to5": "", "notes": "",
+            })
+        for rep in r["reports"]:
+            briefings.append({
+                "review_id": f"B{len(briefings) + 1}", "ticker": t, "time_range": rep["time_range"],
+                "source_data": rep["report_source"], "briefing": rep["report"], "hallucination_1to5": "",
+                "faithfulness_1to5": "", "relevancy_1to5": "", "notes": "",
+            })
+    return {"explanations_to_rate": explanations, "briefings_to_rate": briefings, "claim_misses": claim_misses}
+
+
+def save_review(review: Dict[str, List[Dict]], review_dir: str) -> None:
+    os.makedirs(review_dir, exist_ok=True)
+    for name, rows in review.items():
+        pd.DataFrame(rows).to_csv(os.path.join(review_dir, f"{name}.csv"), index=False)
+    print(f"📝 Review sheets written to {review_dir}")
+
+
+# ── RAG, throughput ──
 def rag_eval(qa_results: List[Dict], llm) -> Dict:
     answered = [q for q in qa_results if q["sources"]]
     prompts = [RAG_JUDGE_PROMPT.format(question=q["question"], context=q["context"], answer=q["answer"])
@@ -274,29 +457,47 @@ def throughput(run_info: Dict, cfg: Config) -> Dict:
 
 def run_evaluation(results: Dict[str, Dict], run_info: Dict, enriched: pd.DataFrame, market: MarketData,
                    llm, cfg: Config, qa_results: Optional[List[Dict]] = None) -> Dict:
+    """All metrics. The returned "review" entry holds the human rating sheets (see save_review)."""
     print("\n📊 Running evaluation...")
-    per_ticker = {}
-    judged_explanations = {}
+    per_ticker, judged_explanations, sentiment_frames, claim_misses = {}, {}, [], []
     for t, r in results.items():
         e = enriched[enriched["ticker"] == t]
+        days = sentiment_days(e, market.features[t])
+        sentiment_frames.append(days)
         per_ticker[t] = {
             "coverage": coverage(e, r["stories"]),
-            "sentiment_alignment": sentiment_alignment(e, market.features[t]),
+            "sentiment_alignment": sentiment_alignment(days),
             "event_explanations": explanation_stats(r["attributions"]),
-            "claims": verify_claims(e, market.events[t], market.prices[t], cfg),
+            "attribution_controls": attribution_controls(t, r["attributions"], r["stories"], market.features[t],
+                                                         market.trading_days, llm, cfg),
+            "claims": verify_claims(e, market.events[t], market.prices[t], cfg, claim_misses),
         }
         judged_explanations[t] = judge_explanations(r["attributions"], llm, cfg.judge_sample_per_ticker)
-        s, x = per_ticker[t]["sentiment_alignment"], per_ticker[t]["event_explanations"]
+        s, x, c = (per_ticker[t][k] for k in ("sentiment_alignment", "event_explanations", "attribution_controls"))
         print(f"   {t}: sentiment↔abnormal return ρ={s.get('spearman_same_day')} (same day), "
               f"{s.get('spearman_next_day')} (next day) | events explained {x.get('explained')} "
+              f"| placebo: shuffled news {c.get('explained_shuffled_news')}, "
+              f"flipped direction {c.get('explained_flipped_direction')} "
               f"| claims precision {per_ticker[t]['claims']['label_precision']}")
+
+    pooled = pd.concat([d for d in sentiment_frames if not d.empty]) if any(
+        not d.empty for d in sentiment_frames) else pd.DataFrame(columns=["sentiment", "abn_ret", "next_abn_ret"])
+    pooled_same = rank_correlation(pooled["sentiment"], pooled["abn_ret"])
+    pooled_next = rank_correlation(pooled["sentiment"], pooled["next_abn_ret"])
+
+    def control_rate(kind: str) -> Optional[float]:
+        counts = [p["attribution_controls"]["counts"][kind] for p in per_ticker.values()
+                  if "counts" in p["attribution_controls"]]
+        return _ratio(sum(k for k, _ in counts), sum(n for _, n in counts))
 
     impact = catalyst_impact(catalyst_days(enriched), market.features)
     reports = judge_reports(results, llm)
+    number_checks = check_reports(results)
     rag = rag_eval(qa_results, llm) if qa_results else None
     tp = throughput(run_info, cfg)
 
     all_judged = [j for items in judged_explanations.values() for j in items]
+    checked = sum(c["numbers"] for c in number_checks.values())
     summary = {
         "articles": tp["articles"],
         "relevant_share": _mean(p["coverage"]["relevant_share"] for p in per_ticker.values()),
@@ -304,15 +505,23 @@ def run_evaluation(results: Dict[str, Dict], run_info: Dict, enriched: pd.DataFr
                                              for p in per_ticker.values()),
         "sentiment_spearman_next_day": _mean(p["sentiment_alignment"].get("spearman_next_day")
                                              for p in per_ticker.values()),
+        "pooled_spearman_same_day": pooled_same,
+        "pooled_spearman_next_day": pooled_next,
         "large_move_sign_agreement": _mean(p["sentiment_alignment"].get("large_move_sign_agreement")
                                            for p in per_ticker.values()),
         "events_with_news": _mean(p["event_explanations"].get("with_news_in_window") for p in per_ticker.values()),
         "events_explained": _mean(p["event_explanations"].get("explained") for p in per_ticker.values()),
+        "control_explained_real": control_rate("real"),
+        "control_explained_shuffled_news": control_rate("shuffled"),
+        "control_explained_flipped_direction": control_rate("flipped"),
         "explanation_tone_matches_move": _mean(p["event_explanations"].get("cited_tone_matches_direction")
                                                for p in per_ticker.values()),
         **{f"explanation_{d}": _mean(j[d]["score"] for j in all_judged) for d in ATTRIBUTION_DIMS},
         "claim_label_precision": _mean(p["claims"]["label_precision"] for p in per_ticker.values()),
         **{f"report_{d}": _mean(j[d]["score"] for j in reports.values()) for d in REPORT_DIMS},
+        "report_numbers_supported": _ratio(checked - sum(len(c["unsupported_numbers"])
+                                                         for c in number_checks.values()), checked),
+        "reports_passing_number_check": _ratio(sum(c["passed"] for c in number_checks.values()), len(number_checks)),
         **({f"rag_{d}": v for d, v in rag["means"].items()} if rag else {}),
         "articles_per_minute": tp["articles_per_minute"],
     }
@@ -320,4 +529,6 @@ def run_evaluation(results: Dict[str, Dict], run_info: Dict, enriched: pd.DataFr
     for k, v in summary.items():
         print(f"   {k}: {v}")
     return {"summary": summary, "per_ticker": per_ticker, "catalyst_impact": impact,
-            "explanation_judge": judged_explanations, "report_judge": reports, "rag": rag, "throughput": tp}
+            "explanation_judge": judged_explanations, "report_judge": reports, "report_number_check": number_checks,
+            "rag": rag, "throughput": tp,
+            "review": review_items(results, judged_explanations, claim_misses, cfg)}

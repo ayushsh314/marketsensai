@@ -61,6 +61,8 @@ class Config:
     price_tolerance: float = 0.02
     claim_window_days: int = 7
     judge_sample_per_ticker: int = 40  # event explanations sent to the LLM judge per ticker
+    control_min_gap_days: int = 10  # placebo news is taken from at least this many trading days away from the event
+    review_per_ticker: int = 15  # judged explanations per ticker exported for human rating
 
     # Output
     output_dir: str = "outputs"
@@ -78,9 +80,13 @@ class Config:
         return os.path.join(self.output_dir, "visualizations")
 
     @property
+    def review_dir(self) -> str:
+        return os.path.join(self.output_dir, "review")
+
+    @property
     def cache_namespace(self) -> str:
         return f"{self.llm_model_name}|{PROMPT_VERSION}"
 
     def make_dirs(self) -> None:
-        for d in [self.output_dir, self.cache_dir, self.viz_dir]:
+        for d in [self.output_dir, self.cache_dir, self.viz_dir, self.review_dir]:
             os.makedirs(d, exist_ok=True)

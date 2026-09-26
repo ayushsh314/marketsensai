@@ -102,7 +102,7 @@ Write these sections in Markdown:
 4. **Sentiment**: the mood and how it changed.
 5. **Takeaway**: 1-2 sentences for an investor.
 
-Use only the information above, cite dates, and say so when a move has no clear news explanation."""
+Use only the information above, cite dates, and say so when a move has no clear news explanation. The price performance figures cover the whole period: never describe them as a move from the previous close. Do not state a price for {ticker}'s benchmark."""
 
 # ── RAG ──
 RAG_QA_PROMPT = """You are a financial Q&A assistant. Today is {as_of}. Answer the question using ONLY the context below, which contains dated news articles and dated explanations of price moves.

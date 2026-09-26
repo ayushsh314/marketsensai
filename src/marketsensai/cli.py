@@ -139,6 +139,7 @@ def cmd_run(args) -> None:
     eval_results = {}
     if not args.skip_eval:
         eval_results = evaluation.run_evaluation(results, run_info, enriched, market, llm, cfg, qa_results)
+        evaluation.save_review(eval_results.pop("review"), cfg.review_dir)
         _dump(eval_results, os.path.join(cfg.output_dir, "eval_results.json"))
 
     if not args.skip_viz:

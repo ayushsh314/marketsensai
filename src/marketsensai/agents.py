@@ -247,26 +247,63 @@ class EventAttributionAgent:
         salience = window["n_articles"] * (0.5 + window["relevance"])
         return window.assign(_s=salience).sort_values("_s", ascending=False).head(self.cfg.max_stories_per_event)
 
+    @staticmethod
+    def base(key: str, row, cands: pd.DataFrame, event_data: str, mtype: str) -> Dict:
+        """Everything about one event day the model is shown, before it answers."""
+        return {
+            "date": key, "labels": row["labels"], "significance": row["significance"], "move_type": mtype,
+            "abn_ret": None if row["abn_ret"] is None or pd.isna(row["abn_ret"]) else float(row["abn_ret"]),
+            "event_data": event_data, "stories": list(cands["story_id"]),
+            "story_sentiment": {sid: None if pd.isna(t) else float(t)
+                                for sid, t in zip(cands["story_id"], cands["sentiment"])},
+            "stories_text": format_stories(cands),
+        }
+
+    def explain(self, ticker: str, bases: List[Dict]) -> List[Dict]:
+        """One LLM call per event day; returns each base with the model's explanation, validated."""
+        prompts = [EVENT_ATTRIBUTION_PROMPT.format(
+            ticker=ticker, date=b["date"], event_data=b["event_data"], days_before=self.cfg.attribution_days_before,
+            stories=b["stories_text"], categories=", ".join(CATALYST_CATEGORIES)) for b in bases]
+        parsed = generate_json(self.llm, prompts, self.max_tokens, schema=EVENT_ATTRIBUTION_SCHEMA)
+        return [self._validate(b, p) for b, p in zip(bases, parsed)]
+
+    @staticmethod
+    def _validate(base: Dict, parsed: Dict) -> Dict:
+        short_to_full = {sid.split("-")[-1]: sid for sid in base["stories"]}
+        cited_raw = [str(c).strip("[] ") for c in parsed.get("cited_stories") or []]
+        cited = [short_to_full[c] for c in cited_raw if c in short_to_full]
+        driver = str(parsed.get("primary_driver") or "unexplained").strip().lower()
+        if driver not in ("market-wide", "unexplained"):
+            driver = normalize_catalyst(driver)
+        # Only a move the prices classify as market-wide can be market-wide; otherwise keep the text but
+        # don't count it as explained.
+        conflict = driver == "market-wide" and base["move_type"] != "market-wide"
+        if conflict:
+            driver = "unexplained"
+        tones = [t for sid, t in base["story_sentiment"].items() if sid in cited and t is not None]
+        return {
+            **base,
+            "cited_tone": round(float(np.mean(tones)), 2) if tones else None,
+            "explanation": str(parsed.get("explanation") or "").strip(),
+            "primary_driver": driver if parsed else "unexplained",
+            "cited_stories": cited,
+            "confidence": _clamp(parsed.get("confidence"), 0.0, 1.0) or 0.0,
+            "invalid_citations": len(cited_raw) - len(cited),
+            "driver_conflict": conflict,
+            "parse_failed": not parsed,
+        }
+
     def attribute(self, ticker: str, event_days: pd.DataFrame, stories: pd.DataFrame, feats: pd.DataFrame,
                   trading_days: pd.DatetimeIndex) -> Tuple[Dict[str, Dict], Dict]:
         days = event_days[event_days["significance"] >= self.cfg.min_event_significance]
         days = days.sort_values("significance", ascending=False)
         if self.cfg.max_events_per_ticker:
             days = days.head(self.cfg.max_events_per_ticker)
-        results, prompts, pending = {}, [], []
+        results, pending = {}, []
         for row in days.to_dict("records"):
             key = str(row["date"].date())
             cands = self.candidate_stories(row["date"], stories, trading_days)
-            event_data = format_event_data(row, feats)
-            base = {
-                "date": key, "labels": row["labels"], "significance": row["significance"],
-                "move_type": move_type(feats.loc[row["date"]]),
-                "abn_ret": None if pd.isna(row["abn_ret"]) else float(row["abn_ret"]),
-                "event_data": event_data, "stories": list(cands["story_id"]),
-                "story_sentiment": {sid: None if pd.isna(t) else float(t)
-                                    for sid, t in zip(cands["story_id"], cands["sentiment"])},
-                "stories_text": format_stories(cands),
-            }
+            base = self.base(key, row, cands, format_event_data(row, feats), move_type(feats.loc[row["date"]]))
             if base["move_type"] in ("modest", "unknown"):
                 # No unusual daily move (e.g. a new high on a quiet day): there is no single day's news to find.
                 results[key] = {**base, "explanation": "No unusual move that day; part of a broader trend.",
@@ -278,36 +315,10 @@ class EventAttributionAgent:
                                 "primary_driver": "no news", "cited_stories": [], "cited_tone": None,
                                 "confidence": 0.0, "invalid_citations": 0, "driver_conflict": False}
                 continue
-            prompts.append(EVENT_ATTRIBUTION_PROMPT.format(
-                ticker=ticker, date=key, event_data=event_data, days_before=self.cfg.attribution_days_before,
-                stories=base["stories_text"], categories=", ".join(CATALYST_CATEGORIES)))
             pending.append(base)
 
-        for base, parsed in zip(pending, generate_json(self.llm, prompts, self.max_tokens,
-                                                       schema=EVENT_ATTRIBUTION_SCHEMA)):
-            short_to_full = {sid.split("-")[-1]: sid for sid in base["stories"]}
-            cited_raw = [str(c).strip("[] ") for c in parsed.get("cited_stories") or []]
-            cited = [short_to_full[c] for c in cited_raw if c in short_to_full]
-            driver = str(parsed.get("primary_driver") or "unexplained").strip().lower()
-            if driver not in ("market-wide", "unexplained"):
-                driver = normalize_catalyst(driver)
-            # Only a move the prices classify as market-wide can be market-wide; otherwise keep the text but
-            # don't count it as explained.
-            conflict = driver == "market-wide" and base["move_type"] != "market-wide"
-            if conflict:
-                driver = "unexplained"
-            tones = [t for sid, t in base["story_sentiment"].items() if sid in cited and t is not None]
-            results[base["date"]] = {
-                **base,
-                "cited_tone": round(float(np.mean(tones)), 2) if tones else None,
-                "explanation": str(parsed.get("explanation") or "").strip(),
-                "primary_driver": driver if parsed else "unexplained",
-                "cited_stories": cited,
-                "confidence": _clamp(parsed.get("confidence"), 0.0, 1.0) or 0.0,
-                "invalid_citations": len(cited_raw) - len(cited),
-                "driver_conflict": conflict,
-                "parse_failed": not parsed,
-            }
+        for result in self.explain(ticker, pending):
+            results[result["date"]] = result
         gradual = sum(r["primary_driver"] == "gradual" for r in results.values())
         stats = {"event_days": len(days), "gradual_event_days": gradual,
                  "events_without_news": len(days) - len(pending) - gradual}
@@ -327,9 +338,11 @@ def format_performance(summary: Dict, benchmark: str) -> str:
     excess = summary["excess_return_pct"]
     vs = ("in line with" if pd.isna(excess) or abs(excess) < 0.05 else
           f"{'outperformed' if excess > 0 else 'underperformed'} {benchmark} by {abs(excess):.2f} percentage points")
-    return (f"First session {summary['start_date']} close {summary['start_close']} → last session "
-            f"{summary['end_date']} close {summary['end_close']} ({_pct(summary['return_pct'])}); "
-            f"{benchmark} {_pct(summary['benchmark_return_pct'])}; the stock {vs}.\n"
+    return (f"Return over the whole period: {_pct(summary['return_pct'])} (close {summary['start_close']} on "
+            f"{summary['start_date']}, the first session, to close {summary['end_close']} on {summary['end_date']}, "
+            f"the last session). This is not a one-day move.\n"
+            f"{benchmark} return over the same period: {_pct(summary['benchmark_return_pct'])} (only its return is "
+            f"given, not its price); the stock {vs}.\n"
             f"Period high {summary['period_high']} on {summary['period_high_date']}; "
             f"low {summary['period_low']} on {summary['period_low_date']}.")
 
@@ -430,11 +443,14 @@ class ReportAgent:
             sentiment_trend=format_trend(trend, freq_name),
             top_stories=format_top_stories(st),
         )
-        prompt = REPORT_PROMPT.format(
-            company=self.company_names.get(ticker, ticker), ticker=ticker, time_range=time_range,
-            start_date=start.strftime("%Y-%m-%d"), end_date=end.strftime("%Y-%m-%d"),
-            as_of=as_of.strftime("%Y-%m-%d"), article_count=len(arts), story_count=len(st), **fields)
-        source = "\n\n".join(f"{k.upper()}:\n{v}" for k, v in fields.items())
+        header = dict(start_date=start.strftime("%Y-%m-%d"), end_date=end.strftime("%Y-%m-%d"),
+                      as_of=as_of.strftime("%Y-%m-%d"), article_count=len(arts), story_count=len(st))
+        prompt = REPORT_PROMPT.format(company=self.company_names.get(ticker, ticker), ticker=ticker,
+                                      time_range=time_range, **header, **fields)
+        # Everything the writer was told, so the judge and the number check see the same facts.
+        period = (f"{header['start_date']} to {header['end_date']} ({time_range}), as of {header['as_of']}; "
+                  f"{header['article_count']} articles, {header['story_count']} stories")
+        source = "\n\n".join(f"{k.upper()}:\n{v}" for k, v in {"period": period, **fields}.items())
         return {"time_range": time_range, "start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d"),
                 "articles": len(arts), "stories": len(st), "price_summary": summary, "themes": themes,
                 "prompt": prompt, "report_source": source}

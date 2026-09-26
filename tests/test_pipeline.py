@@ -104,6 +104,12 @@ def test_evaluation_rag_and_charts(articles, fake_llm, tmp_path):
     assert ev["summary"]["report_hallucination"] == 5.0
     assert ev["summary"]["explanation_groundedness"] == 4.0
     assert ev["rag"]["out_of_corpus_declined"] == 1
+    assert ev["summary"]["reports_passing_number_check"] == 1.0  # the fake briefing has no numbers
+    assert aapl["sentiment_alignment"]["days"] == aapl["sentiment_alignment"]["same_day"]["n"]
+    assert aapl["attribution_controls"]["events"] > 0
+    review = ev["review"]
+    assert len(review["briefings_to_rate"]) == 6  # 2 tickers × 3 ranges
+    assert review["explanations_to_rate"] and all(x["groundedness_1to5"] == "" for x in review["explanations_to_rate"])
 
     visualization.make_all(results, ev, enriched, market, AS_OF, cfg.time_ranges, cfg.viz_dir)
     written = set(os.listdir(cfg.viz_dir))
@@ -129,6 +135,10 @@ def test_cli_run_and_ask(articles, fake_llm, tmp_path, monkeypatch):
               "--corpus", str(corpus), "--output-dir", str(out)])
     for name in ["pipeline_results.json", "articles_enriched.csv", "qa_results.json", "eval_results.json"]:
         assert (out / name).exists()
+    for name in ["explanations_to_rate", "briefings_to_rate", "claim_misses"]:
+        assert (out / "review" / f"{name}.csv").exists()
+    ev = json.loads((out / "eval_results.json").read_text())
+    assert "review" not in ev and "control_explained_shuffled_news" in ev["summary"]
     assert (out / "cache" / "article_analysis.jsonl").exists()
 
     cli.main(["ask", "What drove Apple higher?", "--ticker", "aapl", "--tickers", "AAPL", "MSFT",
@@ -178,3 +188,39 @@ def test_rag_context_carries_precomputed_ages(fake_llm):
     rag = RAGQAModule(["AAPL fell"], meta, np.array([[1.0, 0.0]], "float32"), Const(), fake_llm, AS_OF)
     assert rag.answer("why?", ticker="AAPL")["context"].startswith("(published 56 days ago)")
     assert rag._age("2025-09-25") == "published about 12 months ago"
+
+
+def test_placebo_controls_break_explanations_for_a_news_and_direction_aware_model(articles, tmp_path):
+    from conftest import FakeLLM
+
+    class Aware(FakeLLM):
+        """Explains a move only when it is UP and the stories shown include earnings news."""
+
+        def _reply(self, prompt):
+            p = prompt.lower()
+            if p.startswith("explain what drove"):
+                stories = p.split("news stories published")[1].split("using only these stories")[0]
+                if "direction (abnormal return): up" not in p or "earnings" not in stories:
+                    return json.dumps({"explanation": "No story fits.", "primary_driver": "unexplained",
+                                       "cited_stories": [], "confidence": 0.1})
+            return super()._reply(prompt)
+
+    llm = Aware()
+    cfg = _cfg(tmp_path)
+    market, results, _ = _run(articles, llm, cfg)
+    r = results["AAPL"]
+    c = evaluation.attribution_controls("AAPL", r["attributions"], r["stories"], market.features["AAPL"],
+                                        market.trading_days, llm, cfg)
+    assert c["events"] == 1 and c["explained_real"] == 1.0  # the earnings-driven jump
+    assert c["shuffled_news_events"] == 1 and c["explained_shuffled_news"] == 0.0  # June news can't explain it
+    assert c["explained_flipped_direction"] == 0.0  # good news can't explain a drop
+    flipped = [p for p in llm.calls_starting("explain what drove") if "direction (abnormal return): down" in p.lower()]
+    assert flipped and "Gap Down" in flipped[-1] and "Large Drop" in flipped[-1] and "-8.00%" in flipped[-1]
+
+
+def test_report_source_carries_the_period_facts(articles, fake_llm, tmp_path):
+    _, results, _ = _run(articles, fake_llm, _cfg(tmp_path))
+    rep = results["AAPL"]["reports"][-1]
+    assert rep["report_source"].startswith("PERIOD:\n")
+    assert f"{rep['articles']} articles" in rep["report_source"]
+    assert "Return over the whole period" in rep["report_source"]

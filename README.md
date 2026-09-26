@@ -61,6 +61,7 @@ Outputs (in `--output-dir`, default `outputs/`):
 | `pipeline_results.json` | per ticker: briefings (with their exact source data), every event explanation, stories |
 | `eval_results.json` | summary metrics plus per-ticker detail |
 | `qa_results.json` | RAG demo answers with sources |
+| `review/` | Rating sheets for people: explanations and briefings to score, claim-verification misses to label |
 | `visualizations/` | HTML charts (PNGs with `--png`), and a CSV of event explanations per ticker |
 | `cache/` | per-article LLM analyses and embeddings (safe to delete; rebuilt on demand) |
 
@@ -68,12 +69,13 @@ Outputs (in `--output-dir`, default `outputs/`):
 
 | Metric | How it's measured |
 |---|---|
-| Sentiment ↔ returns | Spearman ρ between daily news sentiment and same-day / next-day abnormal returns; sign agreement on large-move days |
+| Sentiment ↔ returns | Spearman ρ (with 95% CI and p-value, per ticker and pooled) between daily news sentiment and same-day / next-day abnormal returns; sign agreement on large-move days |
 | Catalyst impact | Mean abnormal return on days each catalyst is in the news, split by news tone, and how often the tone called the direction |
 | Event explanations | Share of price-event days with news in the window and explained by it; whether market-wide moves are called market-wide; citation validity |
+| Placebo controls | Every explained event day is re-explained with news from a random other week and with the move's direction mirrored; the real explained rate should be well above both |
 | Explanation quality | LLM judge: groundedness in the cited stories and plausibility (sample of the most significant events) |
 | Claim verification | Price milestones stated in articles ("record high", "52-week low") checked against actual prices |
-| Briefing quality | LLM judge: hallucination, faithfulness and relevancy against the exact data the briefing was written from |
+| Briefing quality | Every number and date in a briefing must appear in its source data; plus an LLM judge of hallucination, faithfulness and relevancy against that data |
 | RAG | Judge scores for answers, and whether out-of-corpus tickers are declined |
 | Throughput | Articles per minute; time vs. an assumed manual reading rate |
 
