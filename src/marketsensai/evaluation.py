@@ -24,6 +24,7 @@ import pandas as pd
 
 from .agents import RELEVANT, EventAttributionAgent, format_event_data
 from .config import Config
+from .data import MARKET_TZ
 from .llm import generate_json
 from .prices import MarketData
 from .prompts import ATTRIBUTION_JUDGE_PROMPT, RAG_JUDGE_PROMPT, REPORT_JUDGE_PROMPT
@@ -105,6 +106,31 @@ def sentiment_days(enriched: pd.DataFrame, feats: pd.DataFrame) -> pd.DataFrame:
     f = feats[["abn_ret", "abn_z"]].copy()
     f["next_abn_ret"] = f["abn_ret"].shift(-1)
     return daily.join(f, how="inner")
+
+
+MARKET_OPEN_MINUTES = 9 * 60 + 30  # 9:30 ET
+NEWS_TIMINGS = ["pre_open", "in_session"]
+
+
+def news_timing(enriched: pd.DataFrame) -> pd.Series:
+    """When each article appeared relative to the session it is assigned to.
+
+    "pre_open": before that session opened (overnight, weekend, or after the previous close), so it can't be
+    a reaction to that session's move. "in_session": during the session, where coverage often reports the move
+    itself. None when only a date is known (e.g. the Kaggle source).
+    """
+    ts = pd.to_datetime(enriched["published_at"], utc=True, errors="coerce").dt.tz_convert(MARKET_TZ)
+    day = ts.dt.tz_localize(None).dt.normalize()
+    minutes = ts.dt.hour * 60 + ts.dt.minute
+    in_session = (day == pd.to_datetime(enriched["trading_date"])) & (minutes >= MARKET_OPEN_MINUTES)
+    labels = np.where(in_session, "in_session", "pre_open").astype(object)
+    labels[ts.isna().to_numpy()] = None
+    return pd.Series(labels, index=enriched.index)
+
+
+def correlations(d: pd.DataFrame) -> Dict:
+    return {"days": len(d), "same_day": rank_correlation(d["sentiment"], d["abn_ret"]),
+            "next_day": rank_correlation(d["sentiment"], d["next_abn_ret"])}
 
 
 def sentiment_alignment(d: pd.DataFrame) -> Dict:
@@ -267,14 +293,15 @@ def attribution_controls(ticker: str, attributions: Dict[str, Dict], stories: pd
     by_id = stories.set_index("story_id", drop=False)
     pool = trading_days[(trading_days >= stories["trading_date"].min()) & (trading_days <= stories["last_date"].max())]
     pool_pos = trading_days.searchsorted(pool)
-    shuffled, flipped = [], []
-    for a in real:
+    shuffled, shuffled_from, flipped = {}, {}, []  # shuffled: index into real → base (some events find none)
+    for i, a in enumerate(real):
         date = pd.Timestamp(a["date"])
         far = pool[np.abs(pool_pos - trading_days.searchsorted(date)) >= cfg.control_min_gap_days]
         for other in rng.permutation(far.to_numpy()):
             cands = agent.candidate_stories(pd.Timestamp(other), stories, trading_days)
             if not cands.empty:
-                shuffled.append(agent.base(a["date"], a, cands, a["event_data"], a["move_type"]))
+                shuffled[i] = agent.base(a["date"], a, cands, a["event_data"], a["move_type"])
+                shuffled_from[i] = str(pd.Timestamp(other).date())
                 break
         f = feats.loc[[date]].copy()
         f[RETURN_COLS] = -f[RETURN_COLS]
@@ -282,21 +309,47 @@ def attribution_controls(ticker: str, attributions: Dict[str, Dict], stories: pd
         row = {**a, "date": date, "labels": labels, "abn_ret": None if a["abn_ret"] is None else -a["abn_ret"]}
         flipped.append(agent.base(a["date"], row, by_id.loc[a["stories"]], format_event_data(row, f), a["move_type"]))
 
-    def explained(items: List[Dict]) -> List[bool]:
-        return [x["primary_driver"] != "unexplained" and not x["parse_failed"] for x in items]
+    def driver(x: Dict) -> str:
+        return "unexplained" if x["parse_failed"] else x["primary_driver"]
 
-    shuffled_ok = explained(agent.explain(ticker, shuffled))
-    flipped_ok = explained(agent.explain(ticker, flipped))
-    real_ok = explained(real)
+    shuffled_drivers = dict(zip(shuffled, map(driver, agent.explain(ticker, list(shuffled.values())))))
+    flipped_drivers = list(map(driver, agent.explain(ticker, flipped)))
+    per_event = [{"date": a["date"], "real_driver": driver(a), "shuffled_news_from": shuffled_from.get(i),
+                  "shuffled_driver": shuffled_drivers.get(i), "flipped_driver": flipped_drivers[i]}
+                 for i, a in enumerate(real)]
     return {
         "events": len(real),
-        "explained_real": _ratio(sum(real_ok), len(real_ok)),
-        "shuffled_news_events": len(shuffled_ok),
-        "explained_shuffled_news": _ratio(sum(shuffled_ok), len(shuffled_ok)),
-        "explained_flipped_direction": _ratio(sum(flipped_ok), len(flipped_ok)),
-        "counts": {"real": [sum(real_ok), len(real_ok)], "shuffled": [sum(shuffled_ok), len(shuffled_ok)],
-                    "flipped": [sum(flipped_ok), len(flipped_ok)]},
+        "explained_real": _ratio(_explained_count(per_event, "real_driver"), len(real)),
+        "shuffled_news_events": len(shuffled),
+        "explained_shuffled_news": _ratio(_explained_count(per_event, "shuffled_driver"), len(shuffled)),
+        "explained_flipped_direction": _ratio(_explained_count(per_event, "flipped_driver"), len(real)),
+        "counts": {"real": [_explained_count(per_event, "real_driver"), len(real)],
+                   "shuffled": [_explained_count(per_event, "shuffled_driver"), len(shuffled)],
+                   "flipped": [_explained_count(per_event, "flipped_driver"), len(real)]},
+        "paired": {kind: _paired(per_event, f"{kind}_driver") for kind in ("shuffled", "flipped")},
+        "per_event": per_event,
     }
+
+
+def _explained_count(per_event: List[Dict], key: str) -> int:
+    return sum(e[key] is not None and e[key] != "unexplained" for e in per_event)
+
+
+def _paired(per_event: List[Dict], key: str) -> Dict:
+    """Events explained with the real evidence but not the control, and vice versa, with McNemar's exact test."""
+    pairs = [(e["real_driver"] != "unexplained", e[key] != "unexplained") for e in per_event if e[key] is not None]
+    real_only = sum(r and not c for r, c in pairs)
+    control_only = sum(c and not r for r, c in pairs)
+    return {"pairs": len(pairs), "real_only": real_only, "control_only": control_only,
+            "p_value": mcnemar_exact(real_only, control_only)}
+
+
+def mcnemar_exact(b: int, c: int) -> Optional[float]:
+    """Two-sided exact McNemar test on the discordant pairs (binomial, p = 0.5)."""
+    n = b + c
+    if n == 0:
+        return None
+    return round(min(1.0, 2 * sum(math.comb(n, k) for k in range(min(b, c) + 1)) / 2 ** n), 4)
 
 
 # ── Claim verification ──
@@ -460,13 +513,19 @@ def run_evaluation(results: Dict[str, Dict], run_info: Dict, enriched: pd.DataFr
     """All metrics. The returned "review" entry holds the human rating sheets (see save_review)."""
     print("\n📊 Running evaluation...")
     per_ticker, judged_explanations, sentiment_frames, claim_misses = {}, {}, [], []
+    timed_frames = {k: [] for k in NEWS_TIMINGS}
     for t, r in results.items():
         e = enriched[enriched["ticker"] == t]
         days = sentiment_days(e, market.features[t])
         sentiment_frames.append(days)
+        timing = news_timing(e)
+        timed = {k: sentiment_days(e[timing == k], market.features[t]) for k in NEWS_TIMINGS}
+        for k, d in timed.items():
+            timed_frames[k].append(d)
         per_ticker[t] = {
             "coverage": coverage(e, r["stories"]),
-            "sentiment_alignment": sentiment_alignment(days),
+            "sentiment_alignment": {**sentiment_alignment(days),
+                                    "by_news_timing": {k: correlations(d) for k, d in timed.items()}},
             "event_explanations": explanation_stats(r["attributions"]),
             "attribution_controls": attribution_controls(t, r["attributions"], r["stories"], market.features[t],
                                                          market.trading_days, llm, cfg),
@@ -480,10 +539,17 @@ def run_evaluation(results: Dict[str, Dict], run_info: Dict, enriched: pd.DataFr
               f"flipped direction {c.get('explained_flipped_direction')} "
               f"| claims precision {per_ticker[t]['claims']['label_precision']}")
 
-    pooled = pd.concat([d for d in sentiment_frames if not d.empty]) if any(
-        not d.empty for d in sentiment_frames) else pd.DataFrame(columns=["sentiment", "abn_ret", "next_abn_ret"])
-    pooled_same = rank_correlation(pooled["sentiment"], pooled["abn_ret"])
-    pooled_next = rank_correlation(pooled["sentiment"], pooled["next_abn_ret"])
+    def pool(frames: List[pd.DataFrame]) -> Dict:
+        frames = [d for d in frames if not d.empty]
+        d = pd.concat(frames) if frames else pd.DataFrame(columns=["sentiment", "abn_ret", "next_abn_ret"])
+        return correlations(d)
+
+    pooled, pooled_timed = pool(sentiment_frames), {k: pool(f) for k, f in timed_frames.items()}
+
+    def paired_p(kind: str) -> Optional[float]:
+        paired = [p["attribution_controls"]["paired"][kind] for p in per_ticker.values()
+                  if "paired" in p["attribution_controls"]]
+        return mcnemar_exact(sum(x["real_only"] for x in paired), sum(x["control_only"] for x in paired))
 
     def control_rate(kind: str) -> Optional[float]:
         counts = [p["attribution_controls"]["counts"][kind] for p in per_ticker.values()
@@ -505,8 +571,10 @@ def run_evaluation(results: Dict[str, Dict], run_info: Dict, enriched: pd.DataFr
                                              for p in per_ticker.values()),
         "sentiment_spearman_next_day": _mean(p["sentiment_alignment"].get("spearman_next_day")
                                              for p in per_ticker.values()),
-        "pooled_spearman_same_day": pooled_same,
-        "pooled_spearman_next_day": pooled_next,
+        "pooled_spearman_same_day": pooled["same_day"],
+        "pooled_spearman_next_day": pooled["next_day"],
+        # Pre-open news can't be a reaction to that session's move; in-session coverage often is.
+        **{f"pooled_spearman_same_day_{k}_news": v["same_day"] for k, v in pooled_timed.items()},
         "large_move_sign_agreement": _mean(p["sentiment_alignment"].get("large_move_sign_agreement")
                                            for p in per_ticker.values()),
         "events_with_news": _mean(p["event_explanations"].get("with_news_in_window") for p in per_ticker.values()),
@@ -514,6 +582,8 @@ def run_evaluation(results: Dict[str, Dict], run_info: Dict, enriched: pd.DataFr
         "control_explained_real": control_rate("real"),
         "control_explained_shuffled_news": control_rate("shuffled"),
         "control_explained_flipped_direction": control_rate("flipped"),
+        "control_shuffled_news_p_value": paired_p("shuffled"),  # McNemar exact, real vs. control, pooled
+        "control_flipped_direction_p_value": paired_p("flipped"),
         "explanation_tone_matches_move": _mean(p["event_explanations"].get("cited_tone_matches_direction")
                                                for p in per_ticker.values()),
         **{f"explanation_{d}": _mean(j[d]["score"] for j in all_judged) for d in ATTRIBUTION_DIMS},

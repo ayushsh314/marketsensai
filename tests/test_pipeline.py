@@ -3,6 +3,8 @@
 import json
 import os
 
+import pandas as pd
+
 from marketsensai import evaluation, visualization
 from marketsensai.config import Config
 from marketsensai.embeddings import embed_articles
@@ -107,6 +109,9 @@ def test_evaluation_rag_and_charts(articles, fake_llm, tmp_path):
     assert ev["summary"]["reports_passing_number_check"] == 1.0  # the fake briefing has no numbers
     assert aapl["sentiment_alignment"]["days"] == aapl["sentiment_alignment"]["same_day"]["n"]
     assert aapl["attribution_controls"]["events"] > 0
+    timing = aapl["sentiment_alignment"]["by_news_timing"]
+    assert set(timing) == {"pre_open", "in_session"} and timing["pre_open"]["days"] > 0
+    assert "control_shuffled_news_p_value" in ev["summary"] and "pooled_spearman_same_day_pre_open_news" in ev["summary"]
     review = ev["review"]
     assert len(review["briefings_to_rate"]) == 6  # 2 tickers × 3 ranges
     assert review["explanations_to_rate"] and all(x["groundedness_1to5"] == "" for x in review["explanations_to_rate"])
@@ -216,6 +221,11 @@ def test_placebo_controls_break_explanations_for_a_news_and_direction_aware_mode
     assert c["explained_flipped_direction"] == 0.0  # good news can't explain a drop
     flipped = [p for p in llm.calls_starting("explain what drove") if "direction (abnormal return): down" in p.lower()]
     assert flipped and "Gap Down" in flipped[-1] and "Large Drop" in flipped[-1] and "-8.00%" in flipped[-1]
+    assert c["paired"]["shuffled"] == {"pairs": 1, "real_only": 1, "control_only": 0, "p_value": 1.0}
+    event = c["per_event"][0]
+    assert event["real_driver"] == "earnings" and event["flipped_driver"] == "unexplained"
+    gap = market.trading_days.get_loc(pd.Timestamp(event["shuffled_news_from"])) - market.trading_days.get_loc(JUMP_DAY)
+    assert abs(gap) >= cfg.control_min_gap_days
 
 
 def test_report_source_carries_the_period_facts(articles, fake_llm, tmp_path):

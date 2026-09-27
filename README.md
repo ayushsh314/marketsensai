@@ -5,7 +5,7 @@
 For any set of tickers, MarketSensAI reads *every* news article over the past year and detects every notable price event from exchange data. It then explains each move with the stories that drove it and writes investor briefings. Prices say what happened, news says why, and the evaluation checks the news against the prices.
 
 > CS6170 Final Project — Northeastern University
-> Anandavardhana Hegde · Ayush Sharma · Yogesh Thakku Suresh
+> Ayush Sharma
 
 ## How it works
 
@@ -69,15 +69,31 @@ Outputs (in `--output-dir`, default `outputs/`):
 
 | Metric | How it's measured |
 |---|---|
-| Sentiment ↔ returns | Spearman ρ (with 95% CI and p-value, per ticker and pooled) between daily news sentiment and same-day / next-day abnormal returns; sign agreement on large-move days |
+| Sentiment ↔ returns | Spearman ρ (with 95% CI and p-value, per ticker and pooled) between daily news sentiment and same-day / next-day abnormal returns, also split into news published before the open vs. during the session (pre-open news can't be a reaction to that day's move); sign agreement on large-move days |
 | Catalyst impact | Mean abnormal return on days each catalyst is in the news, split by news tone, and how often the tone called the direction |
 | Event explanations | Share of price-event days with news in the window and explained by it; whether market-wide moves are called market-wide; citation validity |
-| Placebo controls | Every explained event day is re-explained with news from a random other week and with the move's direction mirrored; the real explained rate should be well above both |
+| Placebo controls | Every explained event day is re-explained with news from a random other week and with the move's direction mirrored; the real explained rate should be well above both. Per-event outcomes are saved and compared with McNemar's exact test |
 | Explanation quality | LLM judge: groundedness in the cited stories and plausibility (sample of the most significant events) |
 | Claim verification | Price milestones stated in articles ("record high", "52-week low") checked against actual prices |
 | Briefing quality | Every number and date in a briefing must appear in its source data; plus an LLM judge of hallucination, faithfulness and relevancy against that data |
 | RAG | Judge scores for answers, and whether out-of-corpus tickers are declined |
 | Throughput | Articles per minute; time vs. an assumed manual reading rate |
+
+## Results
+
+Final run: AAPL, MSFT and AMZN over the year to 2026-09-26, 14,735 articles, Qwen2.5-7B-Instruct on an A100.
+
+| Finding | Result |
+|---|---|
+| Throughput | 14,735 articles analyzed in 6.3 min (2,322/min); whole pipeline in 7.1 min |
+| Briefing figures | 99.7% of numbers in briefings trace to the source data; 11/12 briefings pass the number check |
+| Sentiment ↔ same-day abnormal return | Pooled ρ = 0.109 (95% CI 0.031–0.186, p = 0.006), driven entirely by news published during the session (ρ = 0.181). News published before the open: ρ = 0.003 |
+| Sentiment ↔ next-day abnormal return | ρ = 0.054, not significant (p = 0.18) |
+| Event explanations | 98% of significant moves explained with the real news, but also 82% with news from a random week and 84% with the direction flipped |
+| Claim verification | 41% label precision; 91% of misses are extraction errors by the 7B model (e.g. copying the prompt's examples) |
+| LLM judge | 5/5 on every briefing, including one the number check flagged |
+
+In short, the pipeline is fast and its figures are grounded in market data. News sentiment tracks price moves as coverage *of* them, not ahead of them. A 7B model will explain almost any move from almost any news, and it doesn't reliably judge its own output. That's why the evaluation relies on price-based checks, placebo controls and human ratings.
 
 ## Project layout
 
@@ -117,5 +133,5 @@ pytest
 - **Summaries, not full articles:** Finnhub and yfinance return headlines and summaries, so analysis sees what a summary says.
 - **History limit:** the free Finnhub tier covers about one year.
 - **Correlation, not causation:** explanations attribute moves to the news published around them. The groundedness and plausibility scores measure how well-supported that attribution is, not that the news caused the move.
-- **Self-judging:** the judge is the same model that wrote the outputs. Treat its scores as a rough signal; a stronger or separate judge is better.
+- **Self-judging:** the judge is the same model that wrote the outputs, and in the final run it gave every briefing 5/5. Use the number check, placebo controls and human ratings instead; a stronger or separate judge is better.
 - **Time-to-insight** compares against an assumed manual reading rate, not a measured one.

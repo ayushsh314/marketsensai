@@ -8,11 +8,7 @@ version = "0.2.0"
 description = "Explains stock moves from the news, grounded in market data"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [
-    { name = "Anandavardhana Hegde" },
-    { name = "Ayush Sharma" },
-    { name = "Yogesh Thakku Suresh" },
-]
+authors = [{ name = "Ayush Sharma" }]
 dependencies = [
     "sentence-transformers>=3.0.0",
     "langgraph>=0.2.0",

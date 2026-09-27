@@ -49,3 +49,26 @@ def test_number_check_flags_invented_figures_and_dates():
     assert not check["passed"]
     assert check["unsupported_numbers"] == ["520.00", "222.05"]
     assert check["unsupported_dates"] == ["2026-09-24"]
+
+
+def test_mcnemar_exact():
+    from marketsensai.evaluation import mcnemar_exact
+
+    assert mcnemar_exact(0, 0) is None
+    assert mcnemar_exact(7, 0) == 0.0156  # 2 × 0.5^7
+    assert mcnemar_exact(8, 1) == 0.0391  # 2 × (1 + 9) / 2^9
+    assert mcnemar_exact(3, 3) == 1.0
+
+
+def test_news_timing_separates_reactive_coverage():
+    from marketsensai.evaluation import news_timing
+
+    df = pd.DataFrame({
+        "published_at": ["2026-09-14T21:00:00+00:00",   # 5pm ET Monday → Tuesday's session, before it opens
+                         "2026-09-15T12:00:00+00:00",   # 8am ET Tuesday, before the open
+                         "2026-09-15T15:00:00+00:00",   # 11am ET Tuesday, during the session
+                         "2026-09-13T15:00:00+00:00",   # Sunday → Monday's session
+                         None],                          # date only
+        "trading_date": pd.to_datetime(["2026-09-15", "2026-09-15", "2026-09-15", "2026-09-14", "2026-09-15"]),
+    })
+    assert list(news_timing(df)) == ["pre_open", "pre_open", "in_session", "pre_open", None]
