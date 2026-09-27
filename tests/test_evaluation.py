@@ -72,3 +72,9 @@ def test_news_timing_separates_reactive_coverage():
         "trading_date": pd.to_datetime(["2026-09-15", "2026-09-15", "2026-09-15", "2026-09-14", "2026-09-15"]),
     })
     assert list(news_timing(df)) == ["pre_open", "pre_open", "in_session", "pre_open", None]
+
+
+def test_number_check_treats_year_months_as_dates():
+    source = "SENTIMENT_TREND:\n- Month of 2025-12-01: +0.31 (174 articles)"
+    assert number_check("- **2025-12**: +0.31 (174 articles)", source)["passed"]
+    assert number_check("- **2025-11**: +0.31", source)["unsupported_dates"] == ["2025-11"]

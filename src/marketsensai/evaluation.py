@@ -405,7 +405,7 @@ def judge_reports(results: Dict[str, Dict], llm) -> Dict:
             for (t, r), j in zip(items, generate_json(llm, prompts, 512))}
 
 
-_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+_DATE = re.compile(r"\b\d{4}-\d{2}(?:-\d{2})?\b")  # full dates, and months like "2025-12" in monthly trends
 _NUMBER = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?")
 # Numbers that appear in briefings as names rather than data: "52-week", "50-day", "S&P 500", small counts.
 _STRUCTURAL = {13, 16, 26, 50, 52, 200, 500}
@@ -424,7 +424,7 @@ def number_check(report: str, source: str) -> Dict:
     """
     src_dates = set(_DATE.findall(source))
     src = {abs(float(n.replace(",", ""))) for n in _numbers(source)} | {float(d[:4]) for d in src_dates}
-    bad_dates = sorted({d for d in _DATE.findall(report) if d not in src_dates})
+    bad_dates = sorted({d for d in _DATE.findall(report) if not any(s.startswith(d) for s in src_dates)})
     checked, bad = 0, []
     for token in _numbers(report):
         value = float(token.replace(",", ""))

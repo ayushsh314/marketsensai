@@ -89,7 +89,7 @@ Final run: AAPL, MSFT and AMZN over the year to 2026-09-26, 14,735 articles, Qwe
 | Briefing figures | 99.7% of numbers in briefings trace to the source data; 11/12 briefings pass the number check |
 | Sentiment ↔ same-day abnormal return | Pooled ρ = 0.109 (95% CI 0.031–0.186, p = 0.006), driven entirely by news published during the session (ρ = 0.181). News published before the open: ρ = 0.003 |
 | Sentiment ↔ next-day abnormal return | ρ = 0.054, not significant (p = 0.18) |
-| Event explanations | 98% of significant moves explained with the real news, but also 82% with news from a random week and 84% with the direction flipped |
+| Event explanations | 98% of significant moves explained with the real news, vs. 78% with news from a random week and 82% with the direction flipped (paired McNemar p = 0.012 and 0.039): the model uses the news, but only weakly |
 | Claim verification | 41% label precision; 91% of misses are extraction errors by the 7B model (e.g. copying the prompt's examples) |
 | LLM judge | 5/5 on every briefing, including one the number check flagged |
 
